@@ -49,8 +49,12 @@ const NUL = String.fromCharCode(0);
  * This is what {@link safeStringify} serializes; use it to hand data to a logger.
  */
 export function toSafeJSON(value: unknown, options: SafeStringifyOptions = {}): Json {
-  const out = convert(value, options, undefined);
-  return out === OMIT ? null : out;
+  try {
+    const out = convert(value, options, undefined);
+    return out === OMIT ? null : out;
+  } catch (error) {
+    return `[Unserializable: ${describeError(error)}]`;
+  }
 }
 
 /**
@@ -78,14 +82,24 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 function convert(root: unknown, options: SafeStringifyOptions, bigintToken: string | undefined): Json | typeof OMIT {
   const ancestors: object[] = [];
   const paths: string[] = [];
-  const maxDepth = options.maxDepth ?? Infinity;
-  const maxString = options.maxStringLength ?? Infinity;
-  const maxItems = options.maxArrayLength ?? Infinity;
+  const maxDepth = normalizeLimit(options.maxDepth);
+  const maxString = normalizeLimit(options.maxStringLength);
+  const maxItems = normalizeLimit(options.maxArrayLength);
 
-  const circular = (target: object, depth: number): Json | typeof OMIT => {
+  let inCircular = false;
+  const circular = (target: object, key: string, currentPath: string, depth: number): Json | typeof OMIT => {
     const path = paths[ancestors.indexOf(target)] ?? "~";
-    if (typeof options.circular === "function") return walk(options.circular(path), "", "~", depth);
-    return options.circular ?? `[Circular ${path}]`;
+    if (typeof options.circular === "function" && !inCircular) {
+      inCircular = true;
+      try {
+        return walk(options.circular(path), key, currentPath, depth);
+      } catch (error) {
+        return str(`[Throws: ${describeError(error)}]`);
+      } finally {
+        inCircular = false;
+      }
+    }
+    return typeof options.circular === "string" ? options.circular : `[Circular ${path}]`;
   };
 
   const str = (s: string): string => (s.length > maxString ? `${s.slice(0, maxString)}… (${s.length - maxString} more characters)` : s);
@@ -93,7 +107,7 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
   const list = (items: readonly unknown[], path: string, depth: number, total: number): Json[] => {
     const out: Json[] = [];
     for (let i = 0; i < items.length && i < maxItems; i++) {
-      const v = walk(items[i], String(i), `${path}[${i}]`, depth + 1);
+      const v = walk(read(items, i), String(i), `${path}[${i}]`, depth + 1);
       out.push(v === OMIT ? null : v);
     }
     if (total > maxItems) out.push(`… ${total - maxItems} more items`);
@@ -106,7 +120,13 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
     for (const [key, val] of entries) {
       const child = /^[A-Za-z_$][\w$]*$/.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`;
       const v = walk(val, key, child, depth + 1);
-      if (v !== OMIT) out[key] = v;
+      if (v !== OMIT) {
+        if (key === "__proto__") {
+          Object.defineProperty(out, key, { value: v, enumerable: true, writable: true, configurable: true });
+        } else {
+          out[key] = v;
+        }
+      }
     }
     return out;
   };
@@ -127,7 +147,11 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
       const shown = entries.slice(0, maxItems);
       if (entries.every(([k]) => typeof k === "string" || typeof k === "number")) {
         const out = object(shown.map(([k, val]) => [String(k), val]), path, depth);
-        if (entries.length > maxItems) out["…"] = `${entries.length - maxItems} more entries`;
+        if (entries.length > maxItems) {
+          let marker = "…";
+          while (Object.hasOwn(out, marker)) marker += "…";
+          out[marker] = `${entries.length - maxItems} more entries`;
+        }
         return out;
       }
       return list(shown.map(([k, val]) => [k, val]), path, depth, entries.length);
@@ -135,14 +159,17 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
     if (obj instanceof Set) return list([...obj], path, depth, obj.size);
     if (obj instanceof Error) {
       const out: [string, unknown][] = [
-        ["name", obj.name],
-        ["message", obj.message],
+        ["name", read(obj, "name")],
+        ["message", read(obj, "message")],
       ];
-      if (options.errorStack !== false && obj.stack) out.push(["stack", obj.stack]);
+      if (options.errorStack !== false) {
+        const stack = read(obj, "stack");
+        if (stack) out.push(["stack", stack]);
+      }
       const own = Object.keys(obj);
       for (const k of own) if (k !== "name" && k !== "message" && k !== "stack") out.push([k, read(obj, k)]);
       if ("cause" in obj && !own.includes("cause")) out.push(["cause", read(obj, "cause")]);
-      if (obj instanceof AggregateError && !own.includes("errors")) out.push(["errors", obj.errors]);
+      if (obj instanceof AggregateError && !own.includes("errors")) out.push(["errors", read(obj, "errors")]);
       return object(out, path, depth);
     }
     if (obj instanceof RegExp) return obj.toString();
@@ -174,7 +201,20 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
         }
       }
     }
-    if (options.replacer) v = options.replacer(key, v);
+    if (options.replacer) {
+      try {
+        v = options.replacer(key, v);
+      } catch (error) {
+        v = `[Throws: ${describeError(error)}]`;
+      }
+    }
+    if (v !== null && typeof v === "object") {
+      try {
+        v = unboxPrimitive(v);
+      } catch (error) {
+        return str(`[Throws: ${describeError(error)}]`);
+      }
+    }
 
     switch (typeof v) {
       case "string":
@@ -196,7 +236,7 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
     }
     if (v === null) return null;
     const obj = v as object;
-    if (ancestors.includes(obj)) return circular(obj, depth);
+    if (ancestors.includes(obj)) return circular(obj, key, path || "~", depth);
     if (depth >= maxDepth) return Array.isArray(obj) ? "[Array]" : `[${constructorName(obj) ?? "Object"}]`;
 
     ancestors.push(obj);
@@ -205,7 +245,7 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
       return container(obj, path || "~", depth);
     } catch (error) {
       // A Proxy whose traps throw, or an object that refuses inspection.
-      return `[Throws: ${describeError(error)}]`;
+      return str(`[Throws: ${describeError(error)}]`);
     } finally {
       ancestors.pop();
       paths.pop();
@@ -213,6 +253,45 @@ function convert(root: unknown, options: SafeStringifyOptions, bigintToken: stri
   };
 
   return walk(root, "", "", 0);
+}
+
+function normalizeLimit(value: number | undefined): number {
+  if (value === undefined || Number.isNaN(value)) return Infinity;
+  return Math.max(0, Math.floor(value));
+}
+
+function unboxPrimitive(obj: object): unknown {
+  if (obj instanceof Number || obj instanceof String || obj instanceof Boolean || obj instanceof BigInt) {
+    return obj.valueOf();
+  }
+  switch (Object.prototype.toString.call(obj)) {
+    case "[object Number]":
+      try {
+        return Number.prototype.valueOf.call(obj);
+      } catch {
+        return obj;
+      }
+    case "[object String]":
+      try {
+        return String.prototype.valueOf.call(obj);
+      } catch {
+        return obj;
+      }
+    case "[object Boolean]":
+      try {
+        return Boolean.prototype.valueOf.call(obj);
+      } catch {
+        return obj;
+      }
+    case "[object BigInt]":
+      try {
+        return BigInt.prototype.valueOf.call(obj);
+      } catch {
+        return obj;
+      }
+    default:
+      return obj;
+  }
 }
 
 function constructorName(obj: object): string | undefined {
